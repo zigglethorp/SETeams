@@ -24,12 +24,14 @@ void DuplicateFinder::BuildDuplicateGroups(const vector<PhotoRecord>& photos,
     unordered_map<string, vector<size_t>> bySample;
     unordered_map<string, vector<size_t>> byMeta;
 
+    // Build lookup tables once, then walk them in confidence order below.
     for (size_t i = 0; i < photos.size(); ++i) {
         if (!photos[i].hashes.exactHash.empty()) byExact[photos[i].hashes.exactHash].push_back(i);
         if (!photos[i].hashes.sampleHash.empty()) bySample[photos[i].hashes.sampleHash].push_back(i);
         if (!photos[i].hashes.metadataHash.empty()) byMeta[photos[i].hashes.metadataHash].push_back(i);
     }
 
+    // Exact matches win first so weaker fallback hashes do not split or duplicate those groups.
     for (const auto& kv : byExact) {
         if (kv.second.size() > 1) {
             duplicateGroups.push_back(kv.second);
@@ -37,6 +39,7 @@ void DuplicateFinder::BuildDuplicateGroups(const vector<PhotoRecord>& photos,
         }
     }
 
+    // Sample-hash groups only absorb photos that were not already matched exactly.
     for (const auto& kv : bySample) {
         if (kv.second.size() <= 1) continue;
         vector<size_t> group;
@@ -49,6 +52,7 @@ void DuplicateFinder::BuildDuplicateGroups(const vector<PhotoRecord>& photos,
         }
     }
 
+    // Metadata hashing is the weakest signal, so it only groups photos still unmatched.
     for (const auto& kv : byMeta) {
         if (kv.second.size() <= 1) continue;
         vector<size_t> group;
