@@ -39,18 +39,24 @@ private:
     std::string GetApplePathFromUi() const;
     // Reads and trims the Google folder path from the edit control.
     std::string GetGooglePathFromUi() const;
-    // Rebuilds the flat review-pair list from the latest duplicate groups.
-    void BuildReviewPairs();
-    // Advances to the next reviewable pair, returning false if none remain.
-    bool MoveToNextReviewPair(int direction);
-    // Marks the current pair as intentionally kept and advances to another pair.
-    void SkipCurrentReviewPair();
-    // Refreshes review labels and repaints both image panes.
+    // Rebuilds the reviewable duplicate-group list from the latest duplicate groups.
+    void BuildReviewGroups();
+    // Saves the current group's checkbox state into the review-wide delete selection.
+    void SaveCurrentReviewSelections();
+    // Returns whether a photo is currently marked for deletion.
+    bool IsReviewPhotoSelected(size_t photoIndex) const;
+    // Returns how many photos are currently marked for deletion.
+    size_t SelectedReviewPhotoCount() const;
+    // Moves to another review group or the final delete-selection screen.
+    void NavigateReviewGroup(int direction);
+    // Refreshes review labels, checkbox controls, and preview panes.
     void RefreshReviewWindow();
-    // Handles confirmed deletion from the review window.
-    void DeleteCurrentReviewPhoto(bool deleteLeft);
+    // Handles deletion of every checked photo in the current review group.
+    void DeleteSelectedReviewPhotos();
     // Draws one preview pane in the duplicate review window.
     void PaintReviewPane(HDC hdc, const RECT& bounds, size_t photoIndex, const char* title) const;
+    // Positions the current group's delete checkboxes above their preview panes.
+    void LayoutReviewCheckboxes(const RECT& clientRect);
     // Opens or focuses the duplicate-review window.
     void OpenReviewWindow();
     // Bridges the static callback signature for the review window.
@@ -69,9 +75,13 @@ private:
     HWND hwndLog_ = nullptr;
     HWND hwndReview_ = nullptr;
     HWND hwndReviewStatus_ = nullptr;
+    HWND hwndReviewNext_ = nullptr;
+    HWND hwndReviewDeleteSelected_ = nullptr;
     DuoSortEngine engine_;
-    std::vector<std::pair<size_t, size_t>> reviewPairs_;
-    std::vector<bool> skippedReviewPairs_;
-    size_t reviewPairIndex_ = 0;
+    std::vector<std::vector<size_t>> reviewGroups_;
+    std::vector<HWND> reviewCheckboxes_;
+    std::vector<size_t> selectedReviewPhotos_;
+    size_t reviewGroupIndex_ = 0;
+    bool reviewComplete_ = false;
     ULONG_PTR gdiplusToken_ = 0;
 };

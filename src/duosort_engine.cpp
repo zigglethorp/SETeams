@@ -1,5 +1,10 @@
 #include "duosort_engine.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -16,6 +21,49 @@ bool IsZipArchivePath(const filesystem::path& path) {
         return static_cast<char>(tolower(ch));
     });
     return ext == ".zip";
+}
+
+string LastWindowsErrorMessage(DWORD errorCode) {
+    if (errorCode == ERROR_SUCCESS) return "";
+
+    LPSTR buffer = nullptr;
+    const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+    const DWORD length = FormatMessageA(flags, nullptr, errorCode, 0, reinterpret_cast<LPSTR>(&buffer), 0, nullptr);
+    string message = length > 0 && buffer ? string(buffer, length) : "Windows error " + to_string(errorCode);
+    if (buffer) LocalFree(buffer);
+    while (!message.empty() && (message.back() == '\r' || message.back() == '\n' || message.back() == '.')) {
+        message.pop_back();
+    }
+    return message;
+}
+
+bool DeleteLocalFile(const string& localPath, string& failureReason) {
+    namespace fs = filesystem;
+
+    error_code ec;
+    if (fs::remove(localPath, ec)) return true;
+    if (!ec) {
+        failureReason = "File was not found";
+        return false;
+    }
+
+    const filesystem::path path(localPath);
+    const wstring widePath = path.wstring();
+    DWORD attributes = GetFileAttributesW(widePath.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY)) {
+        SetFileAttributesW(widePath.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+    }
+
+    if (DeleteFileW(widePath.c_str())) return true;
+
+    const DWORD winError = GetLastError();
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY)) {
+        SetFileAttributesW(widePath.c_str(), attributes);
+    }
+
+    failureReason = LastWindowsErrorMessage(winError);
+    if (failureReason.empty()) failureReason = ec.message();
+    return false;
 }
 } // namespace
 
@@ -60,7 +108,6 @@ const vector<vector<size_t>>& DuoSortEngine::DuplicateGroups() const {
 
 // Deletes a local photo after the user confirms the action in the review UI.
 bool DuoSortEngine::DeletePhoto(size_t photoIndex, string& message) {
-    namespace fs = filesystem;
     if (photoIndex >= photos_.size()) {
         message = "Invalid photo selection.";
         return false;
@@ -77,14 +124,10 @@ bool DuoSortEngine::DeletePhoto(size_t photoIndex, string& message) {
     }
 
     // Delete from disk first, then mark the in-memory record so the review UI can skip it.
-    error_code ec;
-    const bool removed = fs::remove(photo.localPath, ec);
-    if (ec) {
+    string failureReason;
+    if (!DeleteLocalFile(photo.localPath, failureReason)) {
         message = "Unable to delete file: " + photo.localPath;
-        return false;
-    }
-    if (!removed) {
-        message = "File was not found: " + photo.localPath;
+        if (!failureReason.empty()) message += " (" + failureReason + ")";
         return false;
     }
 

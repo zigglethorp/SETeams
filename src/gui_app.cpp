@@ -26,9 +26,8 @@ enum ControlIds {
     ID_REVIEW_STATUS = 2001,
     ID_REVIEW_PREV = 2002,
     ID_REVIEW_NEXT = 2003,
-    ID_REVIEW_DELETE_LEFT = 2004,
-    ID_REVIEW_DELETE_RIGHT = 2005,
-    ID_REVIEW_SKIP = 2006
+    ID_REVIEW_DELETE_SELECTED = 2004,
+    ID_REVIEW_CHECKBOX_BASE = 2100
 };
 
 string Trim(const string& s) {
@@ -79,6 +78,30 @@ string FormatPhotoSummary(const PhotoRecord& photo) {
     out << photo.source << " | " << photo.fileName << " | " << photo.fileSize << " bytes";
     if (!photo.localPath.empty()) out << " | " << photo.localPath;
     if (photo.deleted) out << " | deleted";
+    return out.str();
+}
+
+uintmax_t PhotoSizeBytes(const PhotoRecord& photo) {
+    if (photo.fileSize > 0) return photo.fileSize;
+    if (photo.localPath.empty()) return 0;
+
+    error_code ec;
+    const uintmax_t size = filesystem::file_size(photo.localPath, ec);
+    return ec ? 0 : size;
+}
+
+string FormatFreedSpace(uintmax_t bytes) {
+    constexpr double bytesPerMiB = 1024.0 * 1024.0;
+    constexpr double bytesPerGiB = bytesPerMiB * 1024.0;
+
+    ostringstream out;
+    out.setf(ios::fixed);
+    out.precision(2);
+    if (bytes >= static_cast<uintmax_t>(bytesPerGiB)) {
+        out << static_cast<double>(bytes) / bytesPerGiB << " GiB";
+    } else {
+        out << static_cast<double>(bytes) / bytesPerMiB << " MiB";
+    }
     return out.str();
 }
 
@@ -263,21 +286,21 @@ void DuoSortGuiApp::OnRun() {
     engine_.SetAppleRoot(hasApple ? applePath : "");
     engine_.SetGoogleRoot((googleIsDirectory || googleIsZip) ? googlePath : "");
     engine_.Run();
-    BuildReviewPairs();
-    if (reviewPairs_.empty()) {
-        AppendLog("No reviewable duplicate photo pairs are available yet.");
+    selectedReviewPhotos_.clear();
+    reviewComplete_ = false;
+    BuildReviewGroups();
+    if (reviewGroups_.empty()) {
+        AppendLog("No reviewable duplicate photo groups are available yet.");
     } else {
-        AppendLog("Review pairs ready: " + to_string(reviewPairs_.size()) + ". Click Review Duplicates.");
+        AppendLog("Review groups ready: " + to_string(reviewGroups_.size()) + ". Click Review Duplicates.");
     }
 }
 
 void DuoSortGuiApp::OnReviewDuplicates() {
-    BuildReviewPairs();
-    if (reviewPairs_.empty()) {
-        MessageBoxA(hwndMain_,
-                    "No reviewable duplicate pairs are available. Run a scan first, and make sure the duplicates are local files.",
-                    "DuoSort Review",
-                    MB_OK | MB_ICONINFORMATION);
+    BuildReviewGroups();
+    reviewComplete_ = false;
+    if (reviewGroups_.empty()) {
+        AppendLog("No reviewable duplicate groups are available. Run a scan first, and make sure the duplicates are local files.");
         return;
     }
     OpenReviewWindow();
@@ -309,73 +332,67 @@ string DuoSortGuiApp::GetGooglePathFromUi() const {
     return Trim(buffer);
 }
 
-void DuoSortGuiApp::BuildReviewPairs() {
-    reviewPairs_.clear();
-    skippedReviewPairs_.clear();
-    reviewPairIndex_ = 0;
+void DuoSortGuiApp::BuildReviewGroups() {
+    reviewGroups_.clear();
+    reviewGroupIndex_ = 0;
 
     const auto& photos = engine_.Photos();
-    // Flatten each duplicate group into pairwise comparisons so the review UI can stay simple.
     for (const auto& group : engine_.DuplicateGroups()) {
-        if (group.size() < 2) continue;
-        for (size_t i = 0; i < group.size(); ++i) {
-            for (size_t j = i + 1; j < group.size(); ++j) {
-                if (group[i] >= photos.size() || group[j] >= photos.size()) continue;
-                if (!PhotoCanBeReviewed(photos[group[i]]) || !PhotoCanBeReviewed(photos[group[j]])) continue;
-                reviewPairs_.push_back({group[i], group[j]});
-            }
+        vector<size_t> reviewable;
+        for (const size_t photoIndex : group) {
+            if (photoIndex >= photos.size()) continue;
+            if (!PhotoCanBeReviewed(photos[photoIndex])) continue;
+            reviewable.push_back(photoIndex);
         }
+        if (reviewable.size() >= 2) reviewGroups_.push_back(std::move(reviewable));
     }
 
-    skippedReviewPairs_.assign(reviewPairs_.size(), false);
+    if (reviewGroupIndex_ >= reviewGroups_.size()) reviewGroupIndex_ = reviewGroups_.empty() ? 0 : reviewGroups_.size() - 1;
 }
 
-bool DuoSortGuiApp::MoveToNextReviewPair(int direction) {
-    if (reviewPairs_.empty()) return false;
+bool DuoSortGuiApp::IsReviewPhotoSelected(size_t photoIndex) const {
+    return find(selectedReviewPhotos_.begin(), selectedReviewPhotos_.end(), photoIndex) != selectedReviewPhotos_.end();
+}
 
-    size_t attempts = 0;
-    size_t index = reviewPairIndex_;
-    const auto& photos = engine_.Photos();
-    // Walk circularly through the pair list until we find one that still exists and was not skipped.
-    while (attempts < reviewPairs_.size()) {
-        const auto& pair = reviewPairs_[index];
-        if (pair.first < photos.size() && pair.second < photos.size() &&
-            PhotoCanBeReviewed(photos[pair.first]) && PhotoCanBeReviewed(photos[pair.second]) &&
-            (index >= skippedReviewPairs_.size() || !skippedReviewPairs_[index])) {
-            reviewPairIndex_ = index;
-            return true;
-        }
+size_t DuoSortGuiApp::SelectedReviewPhotoCount() const {
+    return selectedReviewPhotos_.size();
+}
 
-        if (direction >= 0) {
-            index = (index + 1) % reviewPairs_.size();
-        } else {
-            index = (index == 0) ? reviewPairs_.size() - 1 : index - 1;
+void DuoSortGuiApp::SaveCurrentReviewSelections() {
+    if (reviewComplete_ || reviewGroups_.empty() || reviewGroupIndex_ >= reviewGroups_.size()) return;
+
+    const auto& group = reviewGroups_[reviewGroupIndex_];
+    for (size_t i = 0; i < group.size() && i < reviewCheckboxes_.size(); ++i) {
+        auto it = find(selectedReviewPhotos_.begin(), selectedReviewPhotos_.end(), group[i]);
+        const bool checked = SendMessageA(reviewCheckboxes_[i], BM_GETCHECK, 0, 0) == BST_CHECKED;
+        if (checked && it == selectedReviewPhotos_.end()) {
+            selectedReviewPhotos_.push_back(group[i]);
+        } else if (!checked && it != selectedReviewPhotos_.end()) {
+            selectedReviewPhotos_.erase(it);
         }
-        ++attempts;
     }
-
-    return false;
 }
 
-void DuoSortGuiApp::SkipCurrentReviewPair() {
-    if (reviewPairs_.empty() || reviewPairIndex_ >= skippedReviewPairs_.size()) return;
-
-    // Skip means "keep both for now" rather than removing the pair permanently from duplicate detection.
-    skippedReviewPairs_[reviewPairIndex_] = true;
-    AppendLog("Skipped review pair " + to_string(reviewPairIndex_ + 1) + ".");
-
-    size_t nextIndex = reviewPairIndex_;
-    if (!reviewPairs_.empty()) nextIndex = (reviewPairIndex_ + 1) % reviewPairs_.size();
-    reviewPairIndex_ = nextIndex;
-
-    if (!MoveToNextReviewPair(+1)) {
-        SetWindowTextA(hwndReviewStatus_, "All duplicate pairs have been reviewed or skipped.");
-        InvalidateRect(hwndReview_, nullptr, TRUE);
-        MessageBoxA(hwndReview_,
-                    "This pair was kept. There are no more reviewable pairs right now.",
-                    "DuoSort Review",
-                    MB_OK | MB_ICONINFORMATION);
+void DuoSortGuiApp::NavigateReviewGroup(int direction) {
+    SaveCurrentReviewSelections();
+    if (reviewGroups_.empty()) {
+        RefreshReviewWindow();
         return;
+    }
+
+    if (direction > 0) {
+        if (!reviewComplete_ && reviewGroupIndex_ + 1 < reviewGroups_.size()) {
+            ++reviewGroupIndex_;
+        } else {
+            reviewComplete_ = true;
+        }
+    } else if (direction < 0) {
+        if (reviewComplete_) {
+            reviewComplete_ = false;
+            reviewGroupIndex_ = reviewGroups_.size() - 1;
+        } else if (reviewGroupIndex_ > 0) {
+            --reviewGroupIndex_;
+        }
     }
 
     RefreshReviewWindow();
@@ -384,51 +401,102 @@ void DuoSortGuiApp::SkipCurrentReviewPair() {
 void DuoSortGuiApp::RefreshReviewWindow() {
     if (!hwndReview_ || !hwndReviewStatus_) return;
 
-    if (!MoveToNextReviewPair(0)) {
-        SetWindowTextA(hwndReviewStatus_, "No reviewable pairs remain.");
+    if (reviewGroups_.empty()) {
+        SetWindowTextA(hwndReviewStatus_, "No reviewable duplicate groups remain.");
+        for (HWND checkbox : reviewCheckboxes_) ShowWindow(checkbox, SW_HIDE);
+        if (hwndReviewNext_) ShowWindow(hwndReviewNext_, SW_HIDE);
+        if (hwndReviewDeleteSelected_) ShowWindow(hwndReviewDeleteSelected_, SW_HIDE);
         InvalidateRect(hwndReview_, nullptr, TRUE);
         return;
     }
 
-    const auto& pair = reviewPairs_[reviewPairIndex_];
+    if (reviewComplete_) {
+        const string status = "Review complete | " + to_string(SelectedReviewPhotoCount()) +
+                              " photo" + (SelectedReviewPhotoCount() == 1 ? "" : "s") +
+                              " selected for deletion | Click Delete Selected to remove them.";
+        SetWindowTextA(hwndReviewStatus_, status.c_str());
+        for (HWND checkbox : reviewCheckboxes_) ShowWindow(checkbox, SW_HIDE);
+        if (hwndReviewNext_) ShowWindow(hwndReviewNext_, SW_HIDE);
+        if (hwndReviewDeleteSelected_) ShowWindow(hwndReviewDeleteSelected_, SW_SHOW);
+        InvalidateRect(hwndReview_, nullptr, TRUE);
+        return;
+    }
+
+    if (hwndReviewNext_) ShowWindow(hwndReviewNext_, SW_SHOW);
+    if (hwndReviewDeleteSelected_) ShowWindow(hwndReviewDeleteSelected_, SW_HIDE);
+
+    const auto& group = reviewGroups_[reviewGroupIndex_];
+    size_t visibleCount = 0;
     const auto& photos = engine_.Photos();
-    const string status = "Pair " + to_string(reviewPairIndex_ + 1) + " of " + to_string(reviewPairs_.size()) +
-                          " | Left: " + photos[pair.first].fileName +
-                          " | Right: " + photos[pair.second].fileName;
+    for (const size_t photoIndex : group) {
+        if (photoIndex < photos.size() && PhotoCanBeReviewed(photos[photoIndex])) ++visibleCount;
+    }
+
+    const string status = "Group " + to_string(reviewGroupIndex_ + 1) + " of " + to_string(reviewGroups_.size()) +
+                          " | " + to_string(visibleCount) + " duplicate photos | " +
+                          to_string(SelectedReviewPhotoCount()) + " selected so far.";
     SetWindowTextA(hwndReviewStatus_, status.c_str());
+
+    RECT clientRect;
+    GetClientRect(hwndReview_, &clientRect);
+    LayoutReviewCheckboxes(clientRect);
+    for (size_t i = 0; i < group.size() && i < reviewCheckboxes_.size(); ++i) {
+        SendMessageA(reviewCheckboxes_[i], BM_SETCHECK,
+                     IsReviewPhotoSelected(group[i]) ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
     InvalidateRect(hwndReview_, nullptr, TRUE);
 }
 
-void DuoSortGuiApp::DeleteCurrentReviewPhoto(bool deleteLeft) {
-    if (reviewPairs_.empty() || reviewPairIndex_ >= reviewPairs_.size()) return;
+void DuoSortGuiApp::DeleteSelectedReviewPhotos() {
+    SaveCurrentReviewSelections();
+    if (selectedReviewPhotos_.empty()) {
+        const char* status = reviewComplete_
+            ? "No photos selected for deletion. Use Previous to review again."
+            : "No photos selected for deletion yet. Use Next to keep reviewing.";
+        SetWindowTextA(hwndReviewStatus_, status);
+        return;
+    }
 
-    const auto& pair = reviewPairs_[reviewPairIndex_];
-    const size_t targetIndex = deleteLeft ? pair.first : pair.second;
+    size_t deletedCount = 0;
+    size_t failedCount = 0;
+    uintmax_t freedBytes = 0;
+    const vector<size_t> photosToDelete = selectedReviewPhotos_;
     const auto& photos = engine_.Photos();
-    if (targetIndex >= photos.size()) return;
+    for (const size_t photoIndex : photosToDelete) {
+        const uintmax_t photoBytes = photoIndex < photos.size() ? PhotoSizeBytes(photos[photoIndex]) : 0;
+        string message;
+        if (engine_.DeletePhoto(photoIndex, message)) {
+            ++deletedCount;
+            freedBytes += photoBytes;
+        } else {
+            ++failedCount;
+            AppendLog(message);
+        }
+    }
 
-    const string prompt = "Delete this photo?\n\n" + photos[targetIndex].localPath;
-    if (MessageBoxA(hwndReview_, prompt.c_str(), "Confirm Delete", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+    selectedReviewPhotos_.clear();
+    reviewComplete_ = false;
+    BuildReviewGroups();
+
+    const string status = "Deleted " + to_string(deletedCount) + " selected photo" + (deletedCount == 1 ? "" : "s") +
+                          ", freeing " + FormatFreedSpace(freedBytes) +
+                          (failedCount > 0 ? "; " + to_string(failedCount) + " failed." : ".");
+    AppendLog(status);
+    if (hwndReviewStatus_) SetWindowTextA(hwndReviewStatus_, status.c_str());
+
+    if (hwndReview_) {
+        DestroyWindow(hwndReview_);
         return;
     }
 
-    string message;
-    if (!engine_.DeletePhoto(targetIndex, message)) {
-        MessageBoxA(hwndReview_, message.c_str(), "Delete Failed", MB_OK | MB_ICONERROR);
-        return;
-    }
-
-    AppendLog(message);
-    // Rebuild review pairs after deletion so missing files disappear from the active queue immediately.
-    BuildReviewPairs();
-    if (reviewPairs_.empty()) {
-        SetWindowTextA(hwndReviewStatus_, "No reviewable pairs remain.");
+    if (reviewGroups_.empty()) {
+        for (HWND checkbox : reviewCheckboxes_) ShowWindow(checkbox, SW_HIDE);
+        if (hwndReviewNext_) ShowWindow(hwndReviewNext_, SW_HIDE);
+        if (hwndReviewDeleteSelected_) ShowWindow(hwndReviewDeleteSelected_, SW_HIDE);
         InvalidateRect(hwndReview_, nullptr, TRUE);
-        MessageBoxA(hwndReview_, "The selected file was deleted. No reviewable duplicate pairs remain.", "DuoSort Review", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
-    if (reviewPairIndex_ >= reviewPairs_.size()) reviewPairIndex_ = reviewPairs_.size() - 1;
     RefreshReviewWindow();
 }
 
@@ -478,6 +546,44 @@ void DuoSortGuiApp::PaintReviewPane(HDC hdc, const RECT& bounds, size_t photoInd
     graphics.DrawImage(image.get(), x, y, drawWidth, drawHeight);
 }
 
+void DuoSortGuiApp::LayoutReviewCheckboxes(const RECT& clientRect) {
+    const int gap = 12;
+    const int left = 12;
+    const int width = max(1, static_cast<int>(clientRect.right - 24));
+
+    size_t visibleCount = 0;
+    if (!reviewComplete_ && !reviewGroups_.empty() && reviewGroupIndex_ < reviewGroups_.size()) {
+        visibleCount = reviewGroups_[reviewGroupIndex_].size();
+    }
+
+    while (reviewCheckboxes_.size() < visibleCount) {
+        const int id = ID_REVIEW_CHECKBOX_BASE + static_cast<int>(reviewCheckboxes_.size());
+        HWND checkbox = CreateWindowA("BUTTON", "Delete", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+                                      0, 0, 90, 22, hwndReview_, reinterpret_cast<HMENU>(id), nullptr, nullptr);
+        reviewCheckboxes_.push_back(checkbox);
+    }
+
+    const int columns = max(1, min(4, static_cast<int>(visibleCount)));
+    const int rows = max(1, static_cast<int>((visibleCount + columns - 1) / columns));
+    const int paneWidth = max(120, (width - (columns - 1) * gap) / columns);
+    const int previewTop = 116;
+    const int availableHeight = max(120, static_cast<int>(clientRect.bottom - previewTop - 12));
+    const int paneHeight = max(120, (availableHeight - (rows - 1) * gap) / rows);
+    for (size_t i = 0; i < reviewCheckboxes_.size(); ++i) {
+        if (i >= visibleCount) {
+            ShowWindow(reviewCheckboxes_[i], SW_HIDE);
+            continue;
+        }
+
+        const int row = static_cast<int>(i) / columns;
+        const int column = static_cast<int>(i) % columns;
+        const int x = left + column * (paneWidth + gap) + 8;
+        const int y = 86 + row * (paneHeight + gap);
+        MoveWindow(reviewCheckboxes_[i], x, y, 90, 22, TRUE);
+        ShowWindow(reviewCheckboxes_[i], SW_SHOW);
+    }
+}
+
 void DuoSortGuiApp::OpenReviewWindow() {
     if (hwndReview_) {
         ShowWindow(hwndReview_, SW_SHOW);
@@ -516,42 +622,43 @@ LRESULT CALLBACK DuoSortGuiApp::StaticReviewWndProc(HWND hwnd, UINT msg, WPARAM 
 LRESULT DuoSortGuiApp::ReviewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
-            // The review window is intentionally lightweight: controls live here, image panes are custom-painted.
+            // The review window keeps controls lightweight while preview panes are custom-painted.
             hwndReviewStatus_ = CreateWindowA(
-                "STATIC", "Review duplicates side by side.", WS_VISIBLE | WS_CHILD,
+                "STATIC", "Review duplicate groups side by side.", WS_VISIBLE | WS_CHILD,
                 12, 12, 1180, 22, hwnd, reinterpret_cast<HMENU>(ID_REVIEW_STATUS), nullptr, nullptr);
             CreateWindowA("BUTTON", "Previous", WS_VISIBLE | WS_CHILD,
                           12, 44, 110, 28, hwnd, reinterpret_cast<HMENU>(ID_REVIEW_PREV), nullptr, nullptr);
-            CreateWindowA("BUTTON", "Next", WS_VISIBLE | WS_CHILD,
-                          130, 44, 110, 28, hwnd, reinterpret_cast<HMENU>(ID_REVIEW_NEXT), nullptr, nullptr);
-            CreateWindowA("BUTTON", "Delete Left", WS_VISIBLE | WS_CHILD,
-                          248, 44, 120, 28, hwnd, reinterpret_cast<HMENU>(ID_REVIEW_DELETE_LEFT), nullptr, nullptr);
-            CreateWindowA("BUTTON", "Delete Right", WS_VISIBLE | WS_CHILD,
-                          376, 44, 120, 28, hwnd, reinterpret_cast<HMENU>(ID_REVIEW_DELETE_RIGHT), nullptr, nullptr);
-            CreateWindowA("BUTTON", "Skip / Keep Both", WS_VISIBLE | WS_CHILD,
-                          504, 44, 150, 28, hwnd, reinterpret_cast<HMENU>(ID_REVIEW_SKIP), nullptr, nullptr);
+            hwndReviewNext_ = CreateWindowA("BUTTON", "Next", WS_VISIBLE | WS_CHILD,
+                                            130, 44, 110, 28, hwnd,
+                                            reinterpret_cast<HMENU>(ID_REVIEW_NEXT), nullptr, nullptr);
+            hwndReviewDeleteSelected_ = CreateWindowA("BUTTON", "Delete Selected", WS_CHILD,
+                                                       248, 44, 150, 28, hwnd,
+                                                       reinterpret_cast<HMENU>(ID_REVIEW_DELETE_SELECTED), nullptr, nullptr);
             return 0;
 
         case WM_COMMAND: {
             const int id = LOWORD(wParam);
+            if (id >= ID_REVIEW_CHECKBOX_BASE && id < ID_REVIEW_CHECKBOX_BASE + 1000) {
+                SaveCurrentReviewSelections();
+                if (!reviewComplete_ && !reviewGroups_.empty() && reviewGroupIndex_ < reviewGroups_.size()) {
+                    const auto& group = reviewGroups_[reviewGroupIndex_];
+                    const string status = "Group " + to_string(reviewGroupIndex_ + 1) + " of " + to_string(reviewGroups_.size()) +
+                                          " | " + to_string(group.size()) + " duplicate photos | " +
+                                          to_string(SelectedReviewPhotoCount()) + " selected so far.";
+                    SetWindowTextA(hwndReviewStatus_, status.c_str());
+                }
+                return 0;
+            }
             if (id == ID_REVIEW_PREV) {
-                if (MoveToNextReviewPair(-1)) RefreshReviewWindow();
+                NavigateReviewGroup(-1);
                 return 0;
             }
             if (id == ID_REVIEW_NEXT) {
-                if (MoveToNextReviewPair(+1)) RefreshReviewWindow();
+                NavigateReviewGroup(+1);
                 return 0;
             }
-            if (id == ID_REVIEW_DELETE_LEFT) {
-                DeleteCurrentReviewPhoto(true);
-                return 0;
-            }
-            if (id == ID_REVIEW_DELETE_RIGHT) {
-                DeleteCurrentReviewPhoto(false);
-                return 0;
-            }
-            if (id == ID_REVIEW_SKIP) {
-                SkipCurrentReviewPair();
+            if (id == ID_REVIEW_DELETE_SELECTED) {
+                DeleteSelectedReviewPhotos();
                 return 0;
             }
             return 0;
@@ -563,24 +670,60 @@ LRESULT DuoSortGuiApp::ReviewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
             RECT clientRect;
             GetClientRect(hwnd, &clientRect);
-            // Split the client area into two preview panes for direct visual comparison.
-            RECT leftPane = {12, 86, (clientRect.right / 2) - 6, clientRect.bottom - 12};
-            RECT rightPane = {(clientRect.right / 2) + 6, 86, clientRect.right - 12, clientRect.bottom - 12};
+            LayoutReviewCheckboxes(clientRect);
 
-            if (!reviewPairs_.empty() && reviewPairIndex_ < reviewPairs_.size()) {
-                const auto& pair = reviewPairs_[reviewPairIndex_];
-                PaintReviewPane(hdc, leftPane, pair.first, "Left Photo");
-                PaintReviewPane(hdc, rightPane, pair.second, "Right Photo");
+            const int gap = 12;
+            const int top = 116;
+            const int left = 12;
+            const int width = max(1, static_cast<int>(clientRect.right - 24));
+
+            if (reviewComplete_) {
+                HBRUSH brush = CreateSolidBrush(RGB(245, 245, 245));
+                RECT summaryPane = {12, 116, clientRect.right - 12, clientRect.bottom - 12};
+                FillRect(hdc, &summaryPane, brush);
+                DeleteObject(brush);
+                const string message = to_string(SelectedReviewPhotoCount()) +
+                                       " photo" + (SelectedReviewPhotoCount() == 1 ? "" : "s") +
+                                       " selected for deletion. Click Delete Selected to remove them, or Previous to review again.";
+                TextOutA(hdc, 20, 130, message.c_str(), static_cast<int>(message.size()));
+            } else if (!reviewGroups_.empty() && reviewGroupIndex_ < reviewGroups_.size()) {
+                const auto& group = reviewGroups_[reviewGroupIndex_];
+                const int columns = max(1, min(4, static_cast<int>(group.size())));
+                const int rows = max(1, static_cast<int>((group.size() + columns - 1) / columns));
+                const int paneWidth = max(120, (width - (columns - 1) * gap) / columns);
+                const int availableHeight = max(120, static_cast<int>(clientRect.bottom - top - 12));
+                const int paneHeight = max(120, (availableHeight - (rows - 1) * gap) / rows);
+
+                for (size_t i = 0; i < group.size(); ++i) {
+                    const int row = static_cast<int>(i) / columns;
+                    const int column = static_cast<int>(i) % columns;
+                    RECT pane = {
+                        left + column * (paneWidth + gap),
+                        top + row * (paneHeight + gap),
+                        left + column * (paneWidth + gap) + paneWidth,
+                        top + row * (paneHeight + gap) + paneHeight
+                    };
+                    const string title = "Photo " + to_string(i + 1);
+                    PaintReviewPane(hdc, pane, group[i], title.c_str());
+                }
             } else {
                 HBRUSH brush = CreateSolidBrush(RGB(245, 245, 245));
-                FillRect(hdc, &leftPane, brush);
-                FillRect(hdc, &rightPane, brush);
+                RECT emptyPane = {12, 116, clientRect.right - 12, clientRect.bottom - 12};
+                FillRect(hdc, &emptyPane, brush);
                 DeleteObject(brush);
-                const char* message = "No reviewable pairs available.";
-                TextOutA(hdc, 20, 100, message, static_cast<int>(strlen(message)));
+                const char* message = "No reviewable duplicate groups available.";
+                TextOutA(hdc, 20, 130, message, static_cast<int>(strlen(message)));
             }
 
             EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_SIZE: {
+            RECT clientRect;
+            GetClientRect(hwnd, &clientRect);
+            LayoutReviewCheckboxes(clientRect);
+            InvalidateRect(hwnd, nullptr, TRUE);
             return 0;
         }
 
@@ -589,8 +732,11 @@ LRESULT DuoSortGuiApp::ReviewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             return 0;
 
         case WM_DESTROY:
+            reviewCheckboxes_.clear();
             hwndReview_ = nullptr;
             hwndReviewStatus_ = nullptr;
+            hwndReviewNext_ = nullptr;
+            hwndReviewDeleteSelected_ = nullptr;
             return 0;
 
         default:
